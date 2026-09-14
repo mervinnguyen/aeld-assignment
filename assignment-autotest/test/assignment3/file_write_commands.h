@@ -23,7 +23,7 @@ static inline char * malloc_first_line_of_file(const char *filename)
 {
     size_t len = 0;
     char *buffer = NULL;
-    FILE *fp = fopen("testfile.txt","r");
+    FILE *fp = fopen(filename,"r");
     ssize_t bytes_read = -1;
     if ( fp != NULL ) {
         /**

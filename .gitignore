@@ -68,3 +68,6 @@ vcpkg_installed/
 Testing/
 .cache/
 testfile.txt
+
+# stray nested checkout, not a real submodule of this repo
+/aesd-assignments/

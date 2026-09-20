@@ -56,7 +56,7 @@ fi
 
 mkdir -p ${OUTDIR}/rootfs
 cd ${OUTDIR}/rootfs
-mkdir -p bin sbin lib lib64 usr usr/bin usr/sbin usr/lib home proc sys dev etc/conf.d
+mkdir -p bin sbin lib lib64 usr usr/bin usr/sbin usr/lib home proc sys dev
 
 cd "$OUTDIR"
 if [ ! -d "${OUTDIR}/busybox" ]
@@ -97,10 +97,11 @@ make CROSS_COMPILE=${CROSS_COMPILE}
 echo "Copying finder scripts and utilities to rootfs/home"
 cp ${FINDER_APP_DIR}/writer ${OUTDIR}/rootfs/home/
 cp ${FINDER_APP_DIR}/finder.sh ${OUTDIR}/rootfs/home/
-cp ${FINDER_APP_DIR}/conf/username.txt ${OUTDIR}/rootfs/etc/conf.d/
-cp ${FINDER_APP_DIR}/conf/assignment.txt ${OUTDIR}/rootfs/etc/conf.d/
+mkdir -p ${OUTDIR}/rootfs/home/conf
+cp ${FINDER_APP_DIR}/conf/username.txt ${OUTDIR}/rootfs/home/conf/
+cp ${FINDER_APP_DIR}/conf/assignment.txt ${OUTDIR}/rootfs/home/conf/
 cp ${FINDER_APP_DIR}/finder-test.sh ${OUTDIR}/rootfs/home/
-sed -i 's|../conf/assignment.txt|/etc/conf.d/assignment.txt|g' ${OUTDIR}/rootfs/home/finder-test.sh
+sed -i 's|\.\./conf/assignment.txt|conf/assignment.txt|g' ${OUTDIR}/rootfs/home/finder-test.sh
 cp ${FINDER_APP_DIR}/autorun-qemu.sh ${OUTDIR}/rootfs/home/
 
 echo "Changing ownership of rootfs"

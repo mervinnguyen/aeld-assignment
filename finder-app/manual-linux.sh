@@ -67,6 +67,10 @@ git clone https://git.busybox.net/busybox
     make distclean
     make defconfig
     sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+    # The "tc" applet references kernel pkt_sched.h/pkt_cls.h struct fields
+    # (e.g. tc_cbq_lssopt) that newer host kernel headers no longer define,
+    # which breaks the busybox build. Disable it since it isn't needed here.
+    sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
 else
     cd busybox
 fi
@@ -75,14 +79,28 @@ echo "Building and installing busybox"
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} install CONFIG_PREFIX=${OUTDIR}/rootfs
 
 echo "Library dependencies"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
+${CROSS_COMPILE}readelf -a ${OUTDIR}/rootfs/bin/busybox | grep "program interpreter" || echo "busybox is statically linked, no interpreter"
+${CROSS_COMPILE}readelf -a ${OUTDIR}/rootfs/bin/busybox | grep "Shared library" || echo "busybox is statically linked, no shared library dependencies"
 
 echo "Copying library dependencies to rootfs"
 SYSROOT=$(${CROSS_COMPILE}gcc -print-sysroot)
-cp ${SYSROOT}/lib64/ld-linux-aarch64.so.1 ${OUTDIR}/rootfs/lib64/
-cp ${SYSROOT}/lib64/libm.so.6 ${OUTDIR}/rootfs/lib64/
-cp ${SYSROOT}/lib64/libc.so.6 ${OUTDIR}/rootfs/lib64/
+if [ -n "${SYSROOT}" ] && [ -e "${SYSROOT}/lib64/ld-linux-aarch64.so.1" ]; then
+    LIBDIR=${SYSROOT}/lib64
+else
+    # Some cross toolchains (e.g. this host's aarch64-none-linux-gnu- build)
+    # report no sysroot and install libraries into the multiarch path instead
+    LIBDIR=/usr/lib/aarch64-linux-gnu
+fi
+cp ${LIBDIR}/ld-linux-aarch64.so.1 ${OUTDIR}/rootfs/lib64/
+cp ${LIBDIR}/libm.so.6 ${OUTDIR}/rootfs/lib64/
+cp ${LIBDIR}/libc.so.6 ${OUTDIR}/rootfs/lib64/
+
+# writer's ELF interpreter path is /lib/ld-linux-aarch64.so.1 (not /lib64/...),
+# and the loader's own default search path doesn't include /lib64, so every
+# lib needs a copy under /lib as well or execve/dlopen fails with ENOENT
+cp ${LIBDIR}/ld-linux-aarch64.so.1 ${OUTDIR}/rootfs/lib/
+cp ${LIBDIR}/libm.so.6 ${OUTDIR}/rootfs/lib/
+cp ${LIBDIR}/libc.so.6 ${OUTDIR}/rootfs/lib/
 
 echo "Creating device nodes"
 sudo mknod -m 666 ${OUTDIR}/rootfs/dev/null c 1 3
@@ -109,5 +127,5 @@ cd ${OUTDIR}/rootfs
 sudo chown -R root:root .
 
 echo "Creating initramfs"
-cd ${OUTDIR}
-find rootfs -print0 | cpio --null -ov --format=newc | gzip -9 > initramfs.cpio.gz
+cd ${OUTDIR}/rootfs
+find . -print0 | cpio --null -ov --format=newc | gzip -9 > ${OUTDIR}/initramfs.cpio.gz

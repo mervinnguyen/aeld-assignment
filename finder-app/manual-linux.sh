@@ -84,21 +84,24 @@ ${CROSS_COMPILE}readelf -a ${OUTDIR}/rootfs/bin/busybox | grep "Shared library" 
 
 echo "Copying library dependencies to rootfs"
 SYSROOT=$(${CROSS_COMPILE}gcc -print-sysroot)
-if [ -n "${SYSROOT}" ] && [ -e "${SYSROOT}/lib64/ld-linux-aarch64.so.1" ]; then
+if [ -n "${SYSROOT}" ] && [ -e "${SYSROOT}/lib/ld-linux-aarch64.so.1" ]; then
+    # ARM GNU toolchain layout: loader in sysroot/lib, libc/libm in sysroot/lib64
+    LOADER=${SYSROOT}/lib/ld-linux-aarch64.so.1
     LIBDIR=${SYSROOT}/lib64
 else
     # Some cross toolchains (e.g. this host's aarch64-none-linux-gnu- build)
-    # report no sysroot and install libraries into the multiarch path instead
+    # report no sysroot and install everything into the multiarch path instead
+    LOADER=/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
     LIBDIR=/usr/lib/aarch64-linux-gnu
 fi
-cp ${LIBDIR}/ld-linux-aarch64.so.1 ${OUTDIR}/rootfs/lib64/
+cp ${LOADER} ${OUTDIR}/rootfs/lib64/
 cp ${LIBDIR}/libm.so.6 ${OUTDIR}/rootfs/lib64/
 cp ${LIBDIR}/libc.so.6 ${OUTDIR}/rootfs/lib64/
 
 # writer's ELF interpreter path is /lib/ld-linux-aarch64.so.1 (not /lib64/...),
 # and the loader's own default search path doesn't include /lib64, so every
 # lib needs a copy under /lib as well or execve/dlopen fails with ENOENT
-cp ${LIBDIR}/ld-linux-aarch64.so.1 ${OUTDIR}/rootfs/lib/
+cp ${LOADER} ${OUTDIR}/rootfs/lib/
 cp ${LIBDIR}/libm.so.6 ${OUTDIR}/rootfs/lib/
 cp ${LIBDIR}/libc.so.6 ${OUTDIR}/rootfs/lib/
 

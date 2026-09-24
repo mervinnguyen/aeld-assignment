@@ -71,3 +71,6 @@ testfile.txt
 
 # stray nested checkout, not a real submodule of this repo
 /aesd-assignments/
+
+# cross/native build output of finder-app
+/finder-app/writer

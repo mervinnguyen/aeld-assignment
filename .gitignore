@@ -74,3 +74,8 @@ testfile.txt
 
 # cross/native build output of finder-app
 /finder-app/writer
+
+# assignment 5 socket server
+!/server/Makefile
+/server/aesdsocket
+/server/valgrind-out.txt

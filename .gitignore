@@ -79,3 +79,12 @@ testfile.txt
 !/server/Makefile
 /server/aesdsocket
 /server/valgrind-out.txt
+
+# from assignments-base
+crosstool-ng
+aesd-build
+.vscode/
+test.sh.log
+aesdsocket
+server/aesdsocket
+server/valgrind-out.txt

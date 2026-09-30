@@ -1,31 +1,58 @@
 /*
- * aesdsocket - AESD Assignment 5 Part 1
+ * aesdsocket - AESD Assignment 6 Part 1
  *
- * Stream socket server on port 9000. Each newline-terminated packet received
- * is appended to DATA_FILE, then the full contents of DATA_FILE are returned
- * to the client. Runs until SIGINT/SIGTERM. Pass -d to run as a daemon.
+ * Stream socket server on port 9000. Each connection is handled by its own
+ * thread. Each newline-terminated packet received is appended to DATA_FILE,
+ * then the full contents of DATA_FILE are returned to the client. A mutex
+ * keeps packets from different threads from interleaving. A timer thread
+ * appends an RFC 2822 "timestamp:" line every 10 seconds. Runs until
+ * SIGINT/SIGTERM, then closes all connections and joins all threads.
+ * Pass -d to run as a daemon.
  */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
-#define PORT        "9000"
-#define DATA_FILE   "/var/tmp/aesdsocketdata"
-#define BACKLOG     10
-#define CHUNK_SIZE  1024
+#define PORT                "9000"
+#define DATA_FILE           "/var/tmp/aesdsocketdata"
+#define BACKLOG             10
+#define CHUNK_SIZE          1024
+#define TIMESTAMP_PERIOD_S  10
 
 static volatile sig_atomic_t exit_requested = 0;
+
+/* Serializes every append + read-back of DATA_FILE. */
+static pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Lets the timer thread sleep but wake immediately on shutdown. */
+static pthread_mutex_t timer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t timer_cond = PTHREAD_COND_INITIALIZER;
+static bool timer_stop = false;
+
+struct client_thread {
+    pthread_t thread;
+    int clientfd;
+    char ipstr[INET_ADDRSTRLEN];
+    atomic_bool complete;
+    SLIST_ENTRY(client_thread) entries;
+};
+
+SLIST_HEAD(client_list, client_thread);
 
 static void signal_handler(int signo)
 {
@@ -33,7 +60,7 @@ static void signal_handler(int signo)
     exit_requested = 1;
 }
 
-/* Install handlers without SA_RESTART so blocking accept()/recv() return EINTR. */
+/* Install handlers without SA_RESTART so blocking accept() returns EINTR. */
 static int setup_signals(void)
 {
     struct sigaction sa;
@@ -46,6 +73,16 @@ static int setup_signals(void)
         return -1;
     }
     return 0;
+}
+
+/* Block or unblock SIGINT/SIGTERM for the calling thread. */
+static void set_exit_signals_blocked(bool blocked)
+{
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    pthread_sigmask(blocked ? SIG_BLOCK : SIG_UNBLOCK, &set, NULL);
 }
 
 /* Create, configure and bind the listening socket. Returns fd or -1. */
@@ -132,7 +169,7 @@ static int daemonize(void)
 static int send_all(int fd, const char *buf, size_t len)
 {
     while (len > 0) {
-        ssize_t sent = send(fd, buf, len, 0);
+        ssize_t sent = send(fd, buf, len, MSG_NOSIGNAL);
         if (sent == -1) {
             if (errno == EINTR)
                 continue;
@@ -145,8 +182,8 @@ static int send_all(int fd, const char *buf, size_t len)
     return 0;
 }
 
-/* Append one packet to DATA_FILE, then stream the whole file to the client. */
-static int handle_packet(int clientfd, const char *packet, size_t len)
+/* Append len bytes to DATA_FILE. Caller must hold data_mutex. */
+static int append_data(const char *data, size_t len)
 {
     int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd == -1) {
@@ -156,7 +193,7 @@ static int handle_packet(int clientfd, const char *packet, size_t len)
 
     size_t written = 0;
     while (written < len) {
-        ssize_t w = write(fd, packet + written, len - written);
+        ssize_t w = write(fd, data + written, len - written);
         if (w == -1) {
             if (errno == EINTR)
                 continue;
@@ -167,17 +204,31 @@ static int handle_packet(int clientfd, const char *packet, size_t len)
         written += (size_t)w;
     }
     close(fd);
+    return 0;
+}
+
+/* Append one packet to DATA_FILE, then stream the whole file to the client. */
+static int handle_packet(int clientfd, const char *packet, size_t len)
+{
+    int rc = 0;
+
+    pthread_mutex_lock(&data_mutex);
+
+    if (append_data(packet, len) != 0) {
+        pthread_mutex_unlock(&data_mutex);
+        return -1;
+    }
 
     /* Read back in fixed chunks: the file may exceed available RAM. */
-    fd = open(DATA_FILE, O_RDONLY);
+    int fd = open(DATA_FILE, O_RDONLY);
     if (fd == -1) {
         syslog(LOG_ERR, "open %s for read failed: %s", DATA_FILE, strerror(errno));
+        pthread_mutex_unlock(&data_mutex);
         return -1;
     }
 
     char buf[CHUNK_SIZE];
     ssize_t n;
-    int rc = 0;
     while ((n = read(fd, buf, sizeof(buf))) != 0) {
         if (n == -1) {
             if (errno == EINTR)
@@ -192,6 +243,8 @@ static int handle_packet(int clientfd, const char *packet, size_t len)
         }
     }
     close(fd);
+
+    pthread_mutex_unlock(&data_mutex);
     return rc;
 }
 
@@ -210,11 +263,9 @@ static void handle_client(int clientfd)
         if (n == 0)
             break;
         if (n == -1) {
-            /* A signal interrupts the recv; finish up with this client. */
-            if (errno == EINTR && !exit_requested)
+            if (errno == EINTR)
                 continue;
-            if (errno != EINTR)
-                syslog(LOG_ERR, "recv failed: %s", strerror(errno));
+            syslog(LOG_ERR, "recv failed: %s", strerror(errno));
             break;
         }
 
@@ -263,10 +314,83 @@ static void handle_client(int clientfd)
     free(packet);
 }
 
+static void *client_thread_fn(void *arg)
+{
+    struct client_thread *ct = arg;
+
+    handle_client(ct->clientfd);
+    syslog(LOG_INFO, "Closed connection from %s", ct->ipstr);
+
+    /* main joins the thread and closes clientfd once it sees this flag. */
+    ct->complete = true;
+    return NULL;
+}
+
+/* Every TIMESTAMP_PERIOD_S seconds, append "timestamp:<RFC 2822 time>\n". */
+static void *timer_thread_fn(void *arg)
+{
+    (void)arg;
+    struct timespec next;
+    clock_gettime(CLOCK_REALTIME, &next);
+
+    pthread_mutex_lock(&timer_mutex);
+    while (!timer_stop) {
+        next.tv_sec += TIMESTAMP_PERIOD_S;
+        int rc;
+        do {
+            rc = pthread_cond_timedwait(&timer_cond, &timer_mutex, &next);
+        } while (rc != ETIMEDOUT && !timer_stop);
+        if (timer_stop)
+            break;
+
+        char line[128];
+        time_t now = time(NULL);
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+        size_t len = strftime(line, sizeof(line), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", &tm_now);
+        if (len == 0) {
+            syslog(LOG_ERR, "strftime failed");
+            continue;
+        }
+
+        pthread_mutex_lock(&data_mutex);
+        append_data(line, len);
+        pthread_mutex_unlock(&data_mutex);
+    }
+    pthread_mutex_unlock(&timer_mutex);
+    return NULL;
+}
+
+/* Join and free every client thread that has finished (or all, if force). */
+static void reap_client_threads(struct client_list *head, bool force)
+{
+    struct client_thread *ct = SLIST_FIRST(head);
+    struct client_thread *prev = NULL;
+
+    while (ct != NULL) {
+        struct client_thread *next = SLIST_NEXT(ct, entries);
+        if (force || ct->complete) {
+            if (force && !ct->complete)
+                shutdown(ct->clientfd, SHUT_RDWR);   /* unblock recv() */
+            pthread_join(ct->thread, NULL);
+            close(ct->clientfd);
+            if (prev == NULL)
+                SLIST_REMOVE_HEAD(head, entries);
+            else
+                SLIST_NEXT(prev, entries) = next;
+            free(ct);
+        } else {
+            prev = ct;
+        }
+        ct = next;
+    }
+}
+
 int main(int argc, char *argv[])
 {
     bool daemon_mode = false;
     int opt;
+    int rc = 0;
 
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
@@ -293,7 +417,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    /* Fork only after the bind has succeeded. */
+    /* Fork only after the bind has succeeded, and before creating threads. */
     if (daemon_mode && daemonize() != 0) {
         close(sockfd);
         closelog();
@@ -307,33 +431,73 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    /* Worker threads inherit a blocked mask, so signals land on main's accept(). */
+    set_exit_signals_blocked(true);
+
+    pthread_t timer_thread;
+    if (pthread_create(&timer_thread, NULL, timer_thread_fn, NULL) != 0) {
+        syslog(LOG_ERR, "pthread_create for timer failed");
+        close(sockfd);
+        closelog();
+        return -1;
+    }
+
+    struct client_list clients;
+    SLIST_INIT(&clients);
+
+    set_exit_signals_blocked(false);
+
     while (!exit_requested) {
         struct sockaddr_in client_addr;
         socklen_t addrlen = sizeof(client_addr);
-        char ipstr[INET_ADDRSTRLEN];
 
         int clientfd = accept(sockfd, (struct sockaddr *)&client_addr, &addrlen);
         if (clientfd == -1) {
-            if (errno == EINTR)
-                continue;
-            syslog(LOG_ERR, "accept failed: %s", strerror(errno));
+            if (errno != EINTR)
+                syslog(LOG_ERR, "accept failed: %s", strerror(errno));
             continue;
         }
 
-        inet_ntop(AF_INET, &client_addr.sin_addr, ipstr, sizeof(ipstr));
-        syslog(LOG_INFO, "Accepted connection from %s", ipstr);
+        struct client_thread *ct = calloc(1, sizeof(*ct));
+        if (ct == NULL) {
+            syslog(LOG_ERR, "calloc failed, dropping connection");
+            close(clientfd);
+            continue;
+        }
+        ct->clientfd = clientfd;
+        inet_ntop(AF_INET, &client_addr.sin_addr, ct->ipstr, sizeof(ct->ipstr));
+        syslog(LOG_INFO, "Accepted connection from %s", ct->ipstr);
 
-        handle_client(clientfd);
+        set_exit_signals_blocked(true);
+        int prc = pthread_create(&ct->thread, NULL, client_thread_fn, ct);
+        set_exit_signals_blocked(false);
+        if (prc != 0) {
+            syslog(LOG_ERR, "pthread_create failed: %s", strerror(prc));
+            close(clientfd);
+            free(ct);
+            continue;
+        }
+        SLIST_INSERT_HEAD(&clients, ct, entries);
 
-        close(clientfd);
-        syslog(LOG_INFO, "Closed connection from %s", ipstr);
+        reap_client_threads(&clients, false);
     }
 
     syslog(LOG_INFO, "Caught signal, exiting");
+
     close(sockfd);
-    if (remove(DATA_FILE) != 0 && errno != ENOENT)
+    reap_client_threads(&clients, true);
+
+    pthread_mutex_lock(&timer_mutex);
+    timer_stop = true;
+    pthread_cond_signal(&timer_cond);
+    pthread_mutex_unlock(&timer_mutex);
+    pthread_join(timer_thread, NULL);
+
+    if (remove(DATA_FILE) != 0 && errno != ENOENT) {
         syslog(LOG_ERR, "remove %s failed: %s", DATA_FILE, strerror(errno));
+        rc = -1;
+    }
     closelog();
 
-    return 0;
+    return rc;
 }
